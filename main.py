@@ -2,7 +2,7 @@ import streamlit as st
 from supabase import create_client, Client
 import hashlib
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 # ─── Supabase Connection ──────────────────────────────────────────────────────
 
@@ -76,7 +76,6 @@ def get_daily_assignments(user_id: int, today: str):
     result = sb().table("daily_assignments").select(
         "*, challenges(title, description)"
     ).eq("user_id", user_id).eq("assigned_date", today).order("id").execute()
-    # Flatten the joined data
     rows = []
     for r in (result.data or []):
         flat = {**r}
@@ -90,35 +89,96 @@ def get_daily_assignments(user_id: int, today: str):
         rows.append(flat)
     return rows
 
-def assign_daily_challenges(user_id: int, today: str):
-    """Assign 6 random challenges for the day if not already assigned."""
-    existing = get_daily_assignments(user_id, today)
-    if existing:
-        return existing
+def get_all_past_challenge_ids(user_id: int) -> set:
+    """Get every challenge_id this user has EVER been assigned (across all days)."""
+    result = sb().table("daily_assignments").select(
+        "challenge_id"
+    ).eq("user_id", user_id).execute()
+    return {r["challenge_id"] for r in (result.data or [])}
+
+def is_day_started(today: str) -> bool:
+    """Check if any assignments exist for today (i.e. admin has started the day)."""
+    result = sb().table("daily_assignments").select(
+        "id"
+    ).eq("assigned_date", today).limit(1).execute()
+    return bool(result.data)
+
+def start_day_for_all_users(today: str) -> tuple[bool, str]:
+    """Admin action: assign 6 unique-ever challenges to every user for today."""
+    if is_day_started(today):
+        return False, "Today's challenges have already been dealt out!"
 
     all_challenges = get_all_challenges()
-    if len(all_challenges) < 6:
-        return []
+    users = sb().table("users").select("id, username").execute().data or []
 
-    chosen = random.sample(all_challenges, 6)
-    rows = []
-    for ch in chosen:
-        rows.append({
-            "user_id": user_id,
-            "challenge_id": ch["id"],
-            "assigned_date": today,
-            "status": "pending"
-        })
+    if not users:
+        return False, "No users registered yet."
+    if len(all_challenges) < 6:
+        return False, f"Need at least 6 challenges in the pool. Currently have {len(all_challenges)}."
+
+    all_challenge_ids = {ch["id"] for ch in all_challenges}
+    errors = []
+    rows_to_insert = []
+
+    for user in users:
+        uid = user["id"]
+        past_ids = get_all_past_challenge_ids(uid)
+        available_ids = all_challenge_ids - past_ids
+
+        if len(available_ids) < 6:
+            errors.append(
+                f"⚠️ {user['username']} only has {len(available_ids)} fresh challenges left (need 6). "
+                f"They've done {len(past_ids)} already. Add more to the pool!"
+            )
+            continue
+
+        chosen_ids = random.sample(list(available_ids), 6)
+        for cid in chosen_ids:
+            rows_to_insert.append({
+                "user_id": uid,
+                "challenge_id": cid,
+                "assigned_date": today,
+                "status": "pending"
+            })
+
+    if not rows_to_insert and errors:
+        return False, "\n".join(errors)
 
     try:
-        sb().table("daily_assignments").upsert(rows, on_conflict="user_id,challenge_id,assigned_date").execute()
-    except Exception:
-        pass
+        for i in range(0, len(rows_to_insert), 100):
+            batch = rows_to_insert[i:i+100]
+            sb().table("daily_assignments").insert(batch).execute()
+    except Exception as e:
+        return False, f"Error assigning challenges: {e}"
 
-    return get_daily_assignments(user_id, today)
+    sb().table("notifications").insert({
+        "message": f"🚀 Day started! Challenges have been dealt for {date.today().strftime('%A, %B %d')}!"
+    }).execute()
+
+    if errors:
+        return True, "Day started, but some users were skipped:\n" + "\n".join(errors)
+
+    return True, f"Challenges dealt to {len(users)} campers! Let's go 🔥"
+
+def get_pool_status_for_users():
+    """For admin: show how many fresh challenges each user has left."""
+    all_challenges = get_all_challenges()
+    total = len(all_challenges)
+    users = sb().table("users").select("id, username").execute().data or []
+
+    status = []
+    for user in users:
+        past_count = len(get_all_past_challenge_ids(user["id"]))
+        remaining = total - past_count
+        status.append({
+            "username": user["username"],
+            "used": past_count,
+            "remaining": remaining,
+            "can_play": remaining >= 6
+        })
+    return status
 
 def complete_challenge(assignment_id: int):
-    from datetime import datetime
     sb().table("daily_assignments").update({
         "status": "completed",
         "completed_at": datetime.now().isoformat()
@@ -143,17 +203,13 @@ def uncomplete_challenge(assignment_id: int):
 # ─── Forfeit Check ────────────────────────────────────────────────────────────
 
 def check_forfeits_for_date(check_date: str):
-    """Check all users for forfeits on a given date."""
     today = date.today().isoformat()
     if check_date >= today:
-        return  # Only check past days
+        return
 
     users = sb().table("users").select("id, username").execute().data or []
-
     for user in users:
         uid = user["id"]
-
-        # Get their assignments for that date
         assignments = sb().table("daily_assignments").select("status").eq(
             "user_id", uid
         ).eq("assigned_date", check_date).execute().data or []
@@ -162,8 +218,6 @@ def check_forfeits_for_date(check_date: str):
             continue
 
         completed_count = sum(1 for a in assignments if a["status"] == "completed")
-
-        # Already forfeited?
         existing = sb().table("forfeits").select("id").eq(
             "user_id", uid
         ).eq("forfeit_date", check_date).execute().data
@@ -178,7 +232,7 @@ def check_forfeits_for_date(check_date: str):
                     "message": f"⚠️ {user['username']} has forfeited on {check_date}!"
                 }).execute()
             except Exception:
-                pass  # Already inserted (race condition)
+                pass
 
 def get_notifications(limit=20):
     result = sb().table("notifications").select("*").order(
@@ -189,18 +243,12 @@ def get_notifications(limit=20):
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
 
 def get_leaderboard():
-    """Build leaderboard from Supabase data."""
     users = sb().table("users").select("id, username").execute().data or []
-
-    # Get all completed counts
     completed_result = sb().table("daily_assignments").select(
         "user_id"
     ).eq("status", "completed").execute().data or []
-
-    # Get all forfeit counts
     forfeit_result = sb().table("forfeits").select("user_id").execute().data or []
 
-    # Count per user
     completed_counts = {}
     for r in completed_result:
         uid = r["user_id"]
@@ -238,55 +286,50 @@ def delete_user(user_id: int):
 def main():
     st.set_page_config(page_title="Camp Challenge Tracker 🏕️", page_icon="🏕️", layout="wide")
 
-    # Run forfeit check for yesterday
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     check_forfeits_for_date(yesterday)
 
-    # Custom CSS
     st.markdown("""
     <style>
         div[data-testid="stSidebar"] { background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%); }
         div[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
         .challenge-card {
             background: linear-gradient(135deg, #667eea22 0%, #764ba222 100%);
-            border: 1px solid #667eea55;
-            border-radius: 12px;
-            padding: 16px;
-            margin: 8px 0;
+            border: 1px solid #667eea55; border-radius: 12px; padding: 16px; margin: 8px 0;
         }
         .completed-card {
             background: linear-gradient(135deg, #2ecc7122 0%, #27ae6022 100%);
-            border: 1px solid #2ecc7155;
-            border-radius: 12px;
-            padding: 16px;
-            margin: 8px 0;
+            border: 1px solid #2ecc7155; border-radius: 12px; padding: 16px; margin: 8px 0;
         }
         .rejected-card {
             background: linear-gradient(135deg, #e74c3c22 0%, #c0392b22 100%);
-            border: 1px solid #e74c3c55;
-            border-radius: 12px;
-            padding: 16px;
-            margin: 8px 0;
+            border: 1px solid #e74c3c55; border-radius: 12px; padding: 16px; margin: 8px 0;
         }
         .forfeit-card {
             background: linear-gradient(135deg, #e74c3c33 0%, #c0392b33 100%);
-            border: 1px solid #e74c3c;
-            border-radius: 12px;
-            padding: 16px;
-            margin: 8px 0;
+            border: 1px solid #e74c3c; border-radius: 12px; padding: 16px; margin: 8px 0;
         }
+        .start-card {
+            background: linear-gradient(135deg, #f39c1222 0%, #e74c3c22 100%);
+            border: 2px solid #f39c12; border-radius: 16px; padding: 24px; margin: 16px 0;
+            text-align: center;
+        }
+        .waiting-card {
+            background: linear-gradient(135deg, #3498db22 0%, #2980b922 100%);
+            border: 2px dashed #3498db; border-radius: 16px; padding: 32px; margin: 16px 0;
+            text-align: center;
+        }
+        .pool-good { color: #2ecc71; font-weight: 700; }
+        .pool-warn { color: #f39c12; font-weight: 700; }
+        .pool-bad { color: #e74c3c; font-weight: 700; }
         .big-number { font-size: 2.5rem; font-weight: 800; }
         .notification-box {
-            background: #ff990022;
-            border-left: 4px solid #ff9900;
-            padding: 10px 16px;
-            margin: 4px 0;
-            border-radius: 0 8px 8px 0;
+            background: #ff990022; border-left: 4px solid #ff9900;
+            padding: 10px 16px; margin: 4px 0; border-radius: 0 8px 8px 0;
         }
     </style>
     """, unsafe_allow_html=True)
 
-    # Session state
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.user = None
@@ -338,14 +381,12 @@ def show_main_app():
     user = st.session_state.user
     is_admin = user.get('is_admin', False)
 
-    # Sidebar
     with st.sidebar:
         st.markdown(f"### 👋 Hey, **{user['username']}**!")
         if is_admin:
             st.markdown("🛡️ **Admin**")
         st.divider()
 
-        # Notifications
         notifications = get_notifications(10)
         if notifications:
             st.markdown("### 🔔 Notifications")
@@ -359,9 +400,8 @@ def show_main_app():
             st.session_state.user = None
             st.rerun()
 
-    # Main tabs
     if is_admin:
-        tabs = st.tabs(["⚔️ My Challenges", "🏆 Leaderboard", "🛠️ Manage Challenges", "👥 Manage Users"])
+        tabs = st.tabs(["⚔️ My Challenges", "🏆 Leaderboard", "🚀 Start Day", "🛠️ Manage Challenges", "👥 Manage Users"])
     else:
         tabs = st.tabs(["⚔️ My Challenges", "🏆 Leaderboard"])
 
@@ -371,8 +411,10 @@ def show_main_app():
         show_leaderboard_tab()
     if is_admin:
         with tabs[2]:
-            show_manage_challenges_tab(user)
+            show_start_day_tab()
         with tabs[3]:
+            show_manage_challenges_tab(user)
+        with tabs[4]:
             show_manage_users_tab()
 
 
@@ -380,13 +422,21 @@ def show_challenges_tab(user):
     today = date.today().isoformat()
     st.markdown(f"## ⚔️ Today's Challenges — {date.today().strftime('%A, %B %d')}")
 
-    assignments = assign_daily_challenges(user['id'], today)
+    day_active = is_day_started(today)
+
+    if not day_active:
+        st.markdown("""<div class="waiting-card">
+            <div style="font-size:3rem">⏳</div>
+            <h3>Waiting for the game master to start today's challenges...</h3>
+            <p style="opacity:0.7">Charles hasn't dealt the cards yet. Sit tight!</p>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    assignments = get_daily_assignments(user['id'], today)
 
     if not assignments:
-        all_ch = get_all_challenges()
-        if len(all_ch) < 6:
-            st.warning(f"Not enough challenges in the pool yet! Need at least 6, currently have {len(all_ch)}. Ask Charles to add more 🙏")
-            return
+        st.info("No challenges assigned to you today. You may have been skipped if there weren't enough fresh challenges left. Talk to Charles 🙏")
+        return
 
     completed = [a for a in assignments if a['status'] == 'completed']
     rejected = [a for a in assignments if a['status'] == 'rejected']
@@ -449,6 +499,69 @@ def show_challenges_tab(user):
                     st.rerun()
 
 
+def show_start_day_tab():
+    today = date.today().isoformat()
+    st.markdown(f"## 🚀 Start Day — {date.today().strftime('%A, %B %d')}")
+
+    day_active = is_day_started(today)
+
+    if day_active:
+        st.success("✅ Today's challenges have already been dealt!")
+        st.divider()
+    else:
+        st.markdown("""<div class="start-card">
+            <div style="font-size:3rem">🃏</div>
+            <h3>Ready to deal today's challenges?</h3>
+            <p style="opacity:0.7">This will assign 6 unique challenges to every registered camper.<br>
+            No one will ever receive a challenge they've already seen.</p>
+        </div>""", unsafe_allow_html=True)
+
+        if st.button("🚀 START TODAY'S GAME", use_container_width=True, type="primary"):
+            with st.spinner("Dealing challenges to all campers..."):
+                success, msg = start_day_for_all_users(today)
+            if success:
+                st.success(msg)
+                st.balloons()
+                st.rerun()
+            else:
+                st.error(msg)
+
+        st.divider()
+
+    # Pool health
+    st.markdown("### 📊 Challenge Pool Health")
+    st.caption("Shows how many fresh (never-seen) challenges each user has remaining.")
+
+    pool_status = get_pool_status_for_users()
+    total_challenges = len(get_all_challenges())
+
+    st.markdown(f"**Total active challenges in pool:** {total_challenges}")
+    st.divider()
+
+    for ps in pool_status:
+        col1, col2, col3 = st.columns([3, 2, 2])
+        with col1:
+            st.markdown(f"**{ps['username']}**")
+        with col2:
+            st.markdown(f"Used: {ps['used']} / {total_challenges}")
+        with col3:
+            if ps['remaining'] >= 12:
+                cls = "pool-good"
+                label = f"✅ {ps['remaining']} left"
+            elif ps['remaining'] >= 6:
+                cls = "pool-warn"
+                label = f"⚠️ {ps['remaining']} left"
+            else:
+                cls = "pool-bad"
+                label = f"❌ {ps['remaining']} left (can't play!)"
+            st.markdown(f'<span class="{cls}">{label}</span>', unsafe_allow_html=True)
+
+    if total_challenges > 0:
+        max_days = total_challenges // 6
+        st.divider()
+        st.info(f"💡 With {total_challenges} challenges, each camper can play for a maximum of **{max_days} days** before running out of fresh ones. Add more challenges to extend the game!")
+
+
 def show_leaderboard_tab():
     st.markdown("## 🏆 Leaderboard")
 
@@ -501,7 +614,7 @@ def show_leaderboard_tab():
 
 def show_manage_challenges_tab(user):
     st.markdown("## 🛠️ Manage Challenges")
-    st.markdown("Add challenges that will be randomly assigned to users each day.")
+    st.markdown("Add challenges to the pool. Once you start the day, 6 are randomly dealt to each camper.")
 
     with st.form("add_challenge_form"):
         title = st.text_input("Challenge Title", placeholder="e.g. Do 20 pushups")
@@ -516,12 +629,35 @@ def show_manage_challenges_tab(user):
                 st.error(msg)
 
     st.divider()
+
+    # Bulk add
+    st.markdown("### ⚡ Bulk Add Challenges")
+    st.caption("Paste one challenge per line. Format: `Title | Description` (description is optional)")
+    with st.form("bulk_add_form"):
+        bulk_text = st.text_area("Paste challenges here", height=150,
+            placeholder="Do 20 pushups | Must be witnessed\nSing a song at dinner\nWear your shirt inside out all day")
+        bulk_submitted = st.form_submit_button("➕ Add All", use_container_width=True)
+        if bulk_submitted and bulk_text.strip():
+            lines = [l.strip() for l in bulk_text.strip().split("\n") if l.strip()]
+            added = 0
+            for line in lines:
+                parts = line.split("|", 1)
+                title = parts[0].strip()
+                desc = parts[1].strip() if len(parts) > 1 else ""
+                if title:
+                    ok, _ = add_challenge(title, desc, user['username'])
+                    if ok:
+                        added += 1
+            st.success(f"Added {added}/{len(lines)} challenges 🔥")
+            st.rerun()
+
+    st.divider()
     st.markdown("### 📋 Current Challenge Pool")
     challenges = get_all_challenges()
     if not challenges:
         st.info("No challenges yet. Add some above!")
     else:
-        st.caption(f"{len(challenges)} active challenges in the pool (need minimum 6)")
+        st.caption(f"{len(challenges)} active challenges — each camper needs 6 fresh ones per day")
         for ch in challenges:
             col1, col2 = st.columns([5, 1])
             with col1:
