@@ -1,87 +1,19 @@
 import streamlit as st
-import sqlite3
-import random
+from supabase import create_client, Client
 import hashlib
-from datetime import datetime, date, time as dtime
-import time
-import os
+import random
+from datetime import date, timedelta
 
-# ─── Database Setup ───────────────────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camp.db")
+# ─── Supabase Connection ──────────────────────────────────────────────────────
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+@st.cache_resource
+def init_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            pin_hash TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS challenges (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            created_by TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            active INTEGER DEFAULT 1
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS daily_assignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            challenge_id INTEGER NOT NULL,
-            assigned_date TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            completed_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (challenge_id) REFERENCES challenges(id),
-            UNIQUE(user_id, challenge_id, assigned_date)
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS forfeits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            forfeit_date TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, forfeit_date)
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    # Create default admin "Charles" with pin 000 if not exists
-    admin_hash = hashlib.sha256("000".encode()).hexdigest()
-    try:
-        c.execute("INSERT INTO users (username, pin_hash, is_admin) VALUES (?, ?, 1)",
-                  ("Charles", admin_hash))
-    except sqlite3.IntegrityError:
-        pass
-
-    conn.commit()
-    conn.close()
+def sb() -> Client:
+    return init_supabase()
 
 def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode()).hexdigest()
@@ -93,24 +25,28 @@ def register_user(username: str, pin: str) -> tuple[bool, str]:
         return False, "PIN must be exactly 3 digits."
     if not username.strip():
         return False, "Username can't be empty bruzz."
-    conn = get_db()
     try:
-        conn.execute("INSERT INTO users (username, pin_hash) VALUES (?, ?)",
-                     (username.strip(), hash_pin(pin)))
-        conn.commit()
-        return True, "Account created! You're in 🔥"
-    except sqlite3.IntegrityError:
-        return False, f"Username '{username}' is already taken. Pick something else 💀"
-    finally:
-        conn.close()
+        result = sb().table("users").insert({
+            "username": username.strip(),
+            "pin_hash": hash_pin(pin),
+            "is_admin": False
+        }).execute()
+        if result.data:
+            return True, "Account created! You're in 🔥"
+        return False, "Something went wrong."
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower() or "23505" in str(e):
+            return False, f"Username '{username}' is already taken. Pick something else 💀"
+        return False, f"Error: {e}"
 
 def login_user(username: str, pin: str) -> tuple[bool, dict | str]:
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ? AND pin_hash = ?",
-                        (username.strip(), hash_pin(pin))).fetchone()
-    conn.close()
-    if user:
-        return True, dict(user)
+    result = sb().table("users").select("*").eq(
+        "username", username.strip()
+    ).eq(
+        "pin_hash", hash_pin(pin)
+    ).execute()
+    if result.data:
+        return True, result.data[0]
     return False, "Wrong username or PIN 🥷"
 
 # ─── Challenge Functions ──────────────────────────────────────────────────────
@@ -118,36 +54,41 @@ def login_user(username: str, pin: str) -> tuple[bool, dict | str]:
 def add_challenge(title: str, description: str, created_by: str) -> tuple[bool, str]:
     if not title.strip():
         return False, "Challenge needs a title."
-    conn = get_db()
-    conn.execute("INSERT INTO challenges (title, description, created_by) VALUES (?, ?, ?)",
-                 (title.strip(), description.strip(), created_by))
-    conn.commit()
-    conn.close()
-    return True, "Challenge added 🔥"
+    try:
+        sb().table("challenges").insert({
+            "title": title.strip(),
+            "description": description.strip(),
+            "created_by": created_by,
+            "active": True
+        }).execute()
+        return True, "Challenge added 🔥"
+    except Exception as e:
+        return False, f"Error: {e}"
 
 def get_all_challenges():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM challenges WHERE active = 1").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    result = sb().table("challenges").select("*").eq("active", True).execute()
+    return result.data or []
 
 def delete_challenge(challenge_id: int):
-    conn = get_db()
-    conn.execute("UPDATE challenges SET active = 0 WHERE id = ?", (challenge_id,))
-    conn.commit()
-    conn.close()
+    sb().table("challenges").update({"active": False}).eq("id", challenge_id).execute()
 
 def get_daily_assignments(user_id: int, today: str):
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT da.*, c.title, c.description
-        FROM daily_assignments da
-        JOIN challenges c ON da.challenge_id = c.id
-        WHERE da.user_id = ? AND da.assigned_date = ?
-        ORDER BY da.id
-    """, (user_id, today)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    result = sb().table("daily_assignments").select(
+        "*, challenges(title, description)"
+    ).eq("user_id", user_id).eq("assigned_date", today).order("id").execute()
+    # Flatten the joined data
+    rows = []
+    for r in (result.data or []):
+        flat = {**r}
+        if "challenges" in flat and flat["challenges"]:
+            flat["title"] = flat["challenges"]["title"]
+            flat["description"] = flat["challenges"]["description"]
+        else:
+            flat["title"] = "Unknown"
+            flat["description"] = ""
+        del flat["challenges"]
+        rows.append(flat)
+    return rows
 
 def assign_daily_challenges(user_id: int, today: str):
     """Assign 6 random challenges for the day if not already assigned."""
@@ -157,156 +98,153 @@ def assign_daily_challenges(user_id: int, today: str):
 
     all_challenges = get_all_challenges()
     if len(all_challenges) < 6:
-        return []  # Not enough challenges in the pool
+        return []
 
-    chosen = random.sample(all_challenges, min(6, len(all_challenges)))
-    conn = get_db()
+    chosen = random.sample(all_challenges, 6)
+    rows = []
     for ch in chosen:
-        try:
-            conn.execute("""
-                INSERT INTO daily_assignments (user_id, challenge_id, assigned_date, status)
-                VALUES (?, ?, ?, 'pending')
-            """, (user_id, ch['id'], today))
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
+        rows.append({
+            "user_id": user_id,
+            "challenge_id": ch["id"],
+            "assigned_date": today,
+            "status": "pending"
+        })
+
+    try:
+        sb().table("daily_assignments").upsert(rows, on_conflict="user_id,challenge_id,assigned_date").execute()
+    except Exception:
+        pass
+
     return get_daily_assignments(user_id, today)
 
 def complete_challenge(assignment_id: int):
-    conn = get_db()
-    conn.execute("""
-        UPDATE daily_assignments
-        SET status = 'completed', completed_at = datetime('now')
-        WHERE id = ? AND status = 'pending'
-    """, (assignment_id,))
-    conn.commit()
-    conn.close()
+    from datetime import datetime
+    sb().table("daily_assignments").update({
+        "status": "completed",
+        "completed_at": datetime.now().isoformat()
+    }).eq("id", assignment_id).eq("status", "pending").execute()
 
 def reject_challenge(assignment_id: int):
-    conn = get_db()
-    conn.execute("""
-        UPDATE daily_assignments
-        SET status = 'rejected'
-        WHERE id = ? AND status = 'pending'
-    """, (assignment_id,))
-    conn.commit()
-    conn.close()
+    sb().table("daily_assignments").update({
+        "status": "rejected"
+    }).eq("id", assignment_id).eq("status", "pending").execute()
 
 def unreject_challenge(assignment_id: int):
-    conn = get_db()
-    conn.execute("""
-        UPDATE daily_assignments
-        SET status = 'pending'
-        WHERE id = ? AND status = 'rejected'
-    """, (assignment_id,))
-    conn.commit()
-    conn.close()
+    sb().table("daily_assignments").update({
+        "status": "pending"
+    }).eq("id", assignment_id).eq("status", "rejected").execute()
 
 def uncomplete_challenge(assignment_id: int):
-    conn = get_db()
-    conn.execute("""
-        UPDATE daily_assignments
-        SET status = 'pending', completed_at = NULL
-        WHERE id = ? AND status = 'completed'
-    """, (assignment_id,))
-    conn.commit()
-    conn.close()
+    sb().table("daily_assignments").update({
+        "status": "pending",
+        "completed_at": None
+    }).eq("id", assignment_id).eq("status", "completed").execute()
 
 # ─── Forfeit Check ────────────────────────────────────────────────────────────
 
 def check_forfeits_for_date(check_date: str):
     """Check all users for forfeits on a given date."""
-    conn = get_db()
-    users = conn.execute("SELECT * FROM users").fetchall()
+    today = date.today().isoformat()
+    if check_date >= today:
+        return  # Only check past days
+
+    users = sb().table("users").select("id, username").execute().data or []
+
     for user in users:
-        assignments = conn.execute("""
-            SELECT status FROM daily_assignments
-            WHERE user_id = ? AND assigned_date = ?
-        """, (user['id'], check_date)).fetchall()
+        uid = user["id"]
+
+        # Get their assignments for that date
+        assignments = sb().table("daily_assignments").select("status").eq(
+            "user_id", uid
+        ).eq("assigned_date", check_date).execute().data or []
 
         if not assignments:
             continue
 
-        completed_count = sum(1 for a in assignments if a['status'] == 'completed')
-        already_forfeited = conn.execute("""
-            SELECT id FROM forfeits WHERE user_id = ? AND forfeit_date = ?
-        """, (user['id'], check_date)).fetchone()
+        completed_count = sum(1 for a in assignments if a["status"] == "completed")
 
-        if completed_count < 3 and not already_forfeited:
-            # Check if the day is over (past midnight)
-            today = date.today().isoformat()
-            if check_date < today:
-                conn.execute("INSERT INTO forfeits (user_id, forfeit_date) VALUES (?, ?)",
-                             (user['id'], check_date))
-                conn.execute("INSERT INTO notifications (message) VALUES (?)",
-                             (f"⚠️ {user['username']} has forfeited on {check_date}!",))
-    conn.commit()
-    conn.close()
+        # Already forfeited?
+        existing = sb().table("forfeits").select("id").eq(
+            "user_id", uid
+        ).eq("forfeit_date", check_date).execute().data
+
+        if completed_count < 3 and not existing:
+            try:
+                sb().table("forfeits").insert({
+                    "user_id": uid,
+                    "forfeit_date": check_date
+                }).execute()
+                sb().table("notifications").insert({
+                    "message": f"⚠️ {user['username']} has forfeited on {check_date}!"
+                }).execute()
+            except Exception:
+                pass  # Already inserted (race condition)
 
 def get_notifications(limit=20):
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    result = sb().table("notifications").select("*").order(
+        "created_at", desc=True
+    ).limit(limit).execute()
+    return result.data or []
 
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
 
 def get_leaderboard():
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT
-            u.username,
-            COALESCE(completed.cnt, 0) as challenges_completed,
-            COALESCE(forfeits.cnt, 0) as forfeit_count
-        FROM users u
-        LEFT JOIN (
-            SELECT user_id, COUNT(*) as cnt
-            FROM daily_assignments WHERE status = 'completed'
-            GROUP BY user_id
-        ) completed ON u.id = completed.user_id
-        LEFT JOIN (
-            SELECT user_id, COUNT(*) as cnt
-            FROM forfeits GROUP BY user_id
-        ) forfeits ON u.id = forfeits.user_id
-        ORDER BY challenges_completed DESC, forfeit_count ASC
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    """Build leaderboard from Supabase data."""
+    users = sb().table("users").select("id, username").execute().data or []
 
-# ─── Admin: Get all users ────────────────────────────────────────────────────
+    # Get all completed counts
+    completed_result = sb().table("daily_assignments").select(
+        "user_id"
+    ).eq("status", "completed").execute().data or []
+
+    # Get all forfeit counts
+    forfeit_result = sb().table("forfeits").select("user_id").execute().data or []
+
+    # Count per user
+    completed_counts = {}
+    for r in completed_result:
+        uid = r["user_id"]
+        completed_counts[uid] = completed_counts.get(uid, 0) + 1
+
+    forfeit_counts = {}
+    for r in forfeit_result:
+        uid = r["user_id"]
+        forfeit_counts[uid] = forfeit_counts.get(uid, 0) + 1
+
+    leaderboard = []
+    for u in users:
+        leaderboard.append({
+            "username": u["username"],
+            "challenges_completed": completed_counts.get(u["id"], 0),
+            "forfeit_count": forfeit_counts.get(u["id"], 0)
+        })
+
+    leaderboard.sort(key=lambda x: (-x["challenges_completed"], x["forfeit_count"]))
+    return leaderboard
+
+# ─── Admin Functions ──────────────────────────────────────────────────────────
 
 def get_all_users():
-    conn = get_db()
-    rows = conn.execute("SELECT id, username, is_admin, created_at FROM users ORDER BY username").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    result = sb().table("users").select("id, username, is_admin, created_at").order("username").execute()
+    return result.data or []
 
 def delete_user(user_id: int):
-    conn = get_db()
-    conn.execute("DELETE FROM daily_assignments WHERE user_id = ?", (user_id,))
-    conn.execute("DELETE FROM forfeits WHERE user_id = ?", (user_id,))
-    conn.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))
-    conn.commit()
-    conn.close()
+    sb().table("daily_assignments").delete().eq("user_id", user_id).execute()
+    sb().table("forfeits").delete().eq("user_id", user_id).execute()
+    sb().table("users").delete().eq("id", user_id).eq("is_admin", False).execute()
 
 # ─── Streamlit App ────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="Camp Challenge Tracker 🏕️", page_icon="🏕️", layout="wide")
-    init_db()
 
-    # Run forfeit checks for yesterday
-    from datetime import timedelta
+    # Run forfeit check for yesterday
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     check_forfeits_for_date(yesterday)
 
     # Custom CSS
     st.markdown("""
     <style>
-        .stApp { }
         div[data-testid="stSidebar"] { background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%); }
         div[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
         .challenge-card {
@@ -398,7 +336,7 @@ def show_login_page():
 
 def show_main_app():
     user = st.session_state.user
-    is_admin = user.get('is_admin', 0) == 1
+    is_admin = user.get('is_admin', False)
 
     # Sidebar
     with st.sidebar:
@@ -413,7 +351,7 @@ def show_main_app():
             st.markdown("### 🔔 Notifications")
             for n in notifications:
                 st.markdown(f"""<div class="notification-box">{n['message']}<br>
-                    <small style="opacity:0.6">{n['created_at']}</small></div>""",
+                    <small style="opacity:0.6">{n['created_at'][:19]}</small></div>""",
                     unsafe_allow_html=True)
         st.divider()
         if st.button("🚪 Log Out", use_container_width=True):
@@ -427,15 +365,10 @@ def show_main_app():
     else:
         tabs = st.tabs(["⚔️ My Challenges", "🏆 Leaderboard"])
 
-    # ── Tab 1: My Challenges ──────────────────────────────────────────────────
     with tabs[0]:
         show_challenges_tab(user)
-
-    # ── Tab 2: Leaderboard ────────────────────────────────────────────────────
     with tabs[1]:
         show_leaderboard_tab()
-
-    # ── Admin Tabs ────────────────────────────────────────────────────────────
     if is_admin:
         with tabs[2]:
             show_manage_challenges_tab(user)
@@ -455,12 +388,10 @@ def show_challenges_tab(user):
             st.warning(f"Not enough challenges in the pool yet! Need at least 6, currently have {len(all_ch)}. Ask Charles to add more 🙏")
             return
 
-    # Count statuses
     completed = [a for a in assignments if a['status'] == 'completed']
     rejected = [a for a in assignments if a['status'] == 'rejected']
     pending = [a for a in assignments if a['status'] == 'pending']
 
-    # Progress bar
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("✅ Completed", f"{len(completed)}/3")
@@ -478,19 +409,14 @@ def show_challenges_tab(user):
 
     st.divider()
 
-    # Show each assignment
     for a in assignments:
         status = a['status']
-
         if status == 'completed':
-            card_class = "completed-card"
-            icon = "✅"
+            card_class, icon = "completed-card", "✅"
         elif status == 'rejected':
-            card_class = "rejected-card"
-            icon = "❌"
+            card_class, icon = "rejected-card", "❌"
         else:
-            card_class = "challenge-card"
-            icon = "⚔️"
+            card_class, icon = "challenge-card", "⚔️"
 
         st.markdown(f"""<div class="{card_class}">
             <strong>{icon} {a['title']}</strong><br>
@@ -511,13 +437,11 @@ def show_challenges_tab(user):
                         st.rerun()
                 else:
                     st.caption("Max rejects used")
-
         elif status == 'completed':
             with bcol1:
                 if st.button("↩️ Undo", key=f"uncomplete_{a['id']}"):
                     uncomplete_challenge(a['id'])
                     st.rerun()
-
         elif status == 'rejected':
             with bcol1:
                 if st.button("↩️ Undo Reject", key=f"unreject_{a['id']}"):
@@ -533,7 +457,6 @@ def show_leaderboard_tab():
         st.info("No data yet — challenges haven't started!")
         return
 
-    # Top 3 podium
     if len(leaderboard) >= 1:
         st.markdown("### 🥇🥈🥉 Top Performers")
         podium_cols = st.columns(min(3, len(leaderboard)))
@@ -543,7 +466,7 @@ def show_leaderboard_tab():
                 p = leaderboard[i]
                 with col:
                     st.markdown(f"""
-                    <div style="text-align:center; padding:20px; background:linear-gradient(135deg, #667eea22, #764ba222); 
+                    <div style="text-align:center; padding:20px; background:linear-gradient(135deg, #667eea22, #764ba222);
                     border-radius:16px; border:1px solid #667eea55;">
                         <div style="font-size:2.5rem">{medals[i]}</div>
                         <div style="font-size:1.3rem; font-weight:700">{p['username']}</div>
@@ -554,8 +477,6 @@ def show_leaderboard_tab():
                     """, unsafe_allow_html=True)
 
     st.divider()
-
-    # Full table
     st.markdown("### 📊 Full Standings")
     import pandas as pd
     df = pd.DataFrame(leaderboard)
@@ -563,13 +484,12 @@ def show_leaderboard_tab():
     df.columns = ["Username", "Challenges Completed", "Forfeits"]
     st.dataframe(df, use_container_width=True, height=400)
 
-    # Shame section
     st.divider()
     if leaderboard:
         worst = max(leaderboard, key=lambda x: x['forfeit_count'])
         if worst['forfeit_count'] > 0:
             st.markdown(f"""<div class="forfeit-card">
-                <strong>💀 Most Forfeits:</strong> {worst['username']} with {worst['forfeit_count']} forfeit(s). 
+                <strong>💀 Most Forfeits:</strong> {worst['username']} with {worst['forfeit_count']} forfeit(s).
                 Absolute scenes.
             </div>""", unsafe_allow_html=True)
 
@@ -597,7 +517,6 @@ def show_manage_challenges_tab(user):
 
     st.divider()
     st.markdown("### 📋 Current Challenge Pool")
-
     challenges = get_all_challenges()
     if not challenges:
         st.info("No challenges yet. Add some above!")
@@ -622,7 +541,7 @@ def show_manage_users_tab():
         with col1:
             admin_badge = " 🛡️ Admin" if u['is_admin'] else ""
             st.markdown(f"**{u['username']}**{admin_badge}")
-            st.caption(f"Joined: {u['created_at']}")
+            st.caption(f"Joined: {u['created_at'][:19]}")
         with col2:
             if not u['is_admin']:
                 if st.button("🗑️", key=f"del_user_{u['id']}"):
@@ -630,6 +549,5 @@ def show_manage_users_tab():
                     st.rerun()
 
 
-# ─── Run ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
